@@ -23,6 +23,8 @@ module Text.Hamlet
     , ihamletFileReload
     , xhamlet
     , xhamletFile
+      -- * jamlet
+    , jamlet
       -- * I18N Hamlet
     , HtmlUrlI18n
     , ihamlet
@@ -61,6 +63,7 @@ import Data.Char (isUpper, isDigit)
 import Data.Maybe (fromMaybe)
 import Data.Text (Text, pack)
 import qualified Data.Text.Lazy as TL
+import Text.Blaze (Markup)
 import Text.Blaze.Html (Html, toHtml)
 import Text.Blaze.Internal (preEscapedText)
 import qualified Data.Foldable as F
@@ -594,3 +597,157 @@ runtimeContentToHtml cd render i18nRender handleMsg = go
         Just (EMixin m) -> m render
         Just (EMixinI18n m) -> m i18nRender render
         _ -> error $ show d ++ ": expected EMixin"
+
+
+------------------------------------------------------------
+-- My Random-Walk Experiments
+jamlet :: QuasiQuoter
+jamlet = QuasiQuoter
+  { quoteExp = jhamletFromString jsRules defaultHamletSettings
+  }
+
+testQ :: String -> Q Exp
+testQ = jhamletFromString jsRules defaultHamletSettings
+
+jhamletFromString :: Q HamletRules -> HamletSettings -> String -> Q Exp
+jhamletFromString qhr set s = do
+    hr <- qhr
+    let doc = docFromString set s
+    hrWithEnv hr $ \env -> docsToJSExp env hr [] $ doc
+
+jsEscape :: Markup -> Markup
+jsEscape s = toHtml "[JAVASCRIPT" >> s >> toHtml "]"
+  
+jsRules :: Q HamletRules
+jsRules = do
+    i <- [|jsEscape|]
+    return $ HamletRules i ($ (Env Nothing Nothing)) (\_ b -> return b)
+
+docsToJSExp :: Env -> HamletRules -> Scope -> [Doc] -> Q Exp
+docsToJSExp env hr scope docs = do
+    runIO $ do print "Running docsToJSExp"
+               print $ "scope = " ++ show scope
+    exps <- mapM (docToJSExp env hr scope) docs
+    case exps of
+        [] -> [|return ()|]
+        [x] -> return x
+        _ -> return $ DoE $ map NoBindS exps
+
+docToJSExp :: Env -> HamletRules -> Scope -> Doc -> Q Exp
+docToJSExp env hr scope doc = do
+  runIO $ do print $ "Running docToJSExp on " ++ show doc
+  retVal <- case doc of 
+    DocForall list idents inside -> do
+      let list' = derefToJSExp scope list
+      (pat, extraScope) <- bindingPattern idents
+      let scope' = extraScope ++ scope
+      mh <- [|F.mapM_|]
+      inside' <- docsToExp env hr scope' inside
+      let lam = LamE [pat] inside'
+      return $ mh `AppE` lam `AppE` list'
+    DocWith [] inside -> do
+      inside' <- docsToExp env hr scope inside
+      return $ inside'
+    DocWith ((deref, idents):dis) inside -> do
+      let deref' = derefToJSExp scope deref
+      (pat, extraScope) <- bindingPattern idents
+      let scope' = extraScope ++ scope
+      inside' <- docToJSExp env hr scope' (DocWith dis inside)
+      let lam = LamE [pat] inside'
+      return $ lam `AppE` deref'
+    DocMaybe val idents inside mno -> do
+      let val' = derefToJSExp scope val
+      (pat, extraScope) <- bindingPattern idents
+      let scope' = extraScope ++ scope
+      inside' <- docsToExp env hr scope' inside
+      let inside'' = LamE [pat] inside'
+      ninside' <- case mno of
+                   Nothing -> [|Nothing|]
+                   Just no -> do
+                        no' <- docsToExp env hr scope no
+                        j <- [|Just|]
+                        return $ j `AppE` no'
+      mh <- [|maybeH|]
+      return $ mh `AppE` val' `AppE` inside'' `AppE` ninside'
+    DocCond conds final -> do
+      conds' <- mapM go conds
+      final' <- case final of
+                Nothing -> [|Nothing|]
+                Just f -> do
+                    f' <- docsToExp env hr scope f
+                    j <- [|Just|]
+                    return $ j `AppE` f'
+      ch <- [|condH|]
+      return $ ch `AppE` ListE conds' `AppE` final'
+      where
+        go :: (Deref, [Doc]) -> Q Exp
+        go (d, docs) = do
+          let d' = derefToJSExp ((specialOrIdent, VarE 'or):scope) d
+          docs' <- docsToExp env hr scope docs
+          return $ TupE [d', docs']
+    DocCase deref cases -> do
+      let exp_ = derefToJSExp scope deref
+      matches <- mapM toMatch cases
+      return $ CaseE exp_ matches
+      where
+        toMatch :: (Binding, [Doc]) -> Q Match
+        toMatch (idents, inside) = do
+           (pat, extraScope) <- bindingPattern idents
+           let scope' = extraScope ++ scope
+           insideExp <- docsToExp env hr scope' inside
+           return $ Match pat (NormalB insideExp) []
+    DocContent c -> contentToJSExp env hr scope c
+  runIO $ print retVal
+  return retVal
+
+contentToJSExp :: Env -> HamletRules -> Scope -> Content -> Q Exp
+contentToJSExp env hr scope c =
+  case c of 
+    ContentRaw s -> do
+      os <- [|preEscapedText . pack|]
+      let s' = LitE $ StringL s
+      runIO $ do print "content was exactly: "
+                 putStrLn s
+      return $ hrFromHtml hr `AppE` (os `AppE` s')
+    ContentVar d -> do
+      str <- [|toHtml|]
+      return $ hrFromHtml hr `AppE` (str `AppE` derefToJSExp scope d)
+    ContentUrl hasParams d ->
+      case urlRender env of
+        Nothing -> error "URL interpolation used, but no URL renderer provided"
+        Just wrender -> wrender $ \render -> do
+            let render' = return render
+            ou <- if hasParams
+                    then [|\(u, p) -> $(render') u p|]
+                    else [|\u -> $(render') u []|]
+            let d' = derefToJSExp scope d
+            pet <- [|toHtml|]
+            return $ hrFromHtml hr `AppE` (pet `AppE` (ou `AppE` d'))
+    ContentEmbed d -> hrEmbed hr env $ derefToJSExp scope d
+    ContentMsg d ->
+      case msgRender env of
+        Nothing -> error "Message interpolation used, but no message renderer provided"
+        Just wrender -> wrender $ \render ->
+            return $ hrFromHtml hr `AppE` (render `AppE` derefToJSExp scope d)
+    ContentAttrs d -> do
+      html <- [|attrsToHtml . toAttributes|]
+      return $ hrFromHtml hr `AppE` (html `AppE` derefToJSExp scope d)
+
+expType :: Ident -> Name -> Exp
+expType (Ident (c:_)) = if isUpper c || c == ':' then ConE else VarE
+expType (Ident "") = error "Bad Ident"
+
+derefToJSExp :: Scope -> Deref -> Exp
+derefToJSExp s (DerefBranch x y) = derefToJSExp s x `AppE` derefToJSExp s y
+derefToJSExp _ (DerefModulesIdent mods i@(Ident s)) =
+    expType i $ Name (mkOccName s) (NameQ $ mkModName $ intercalate "." mods)
+derefToJSExp scope (DerefIdent i@(Ident s)) =
+    case lookup i scope of
+        Just e -> e
+        Nothing -> expType i $ mkName s
+derefToJSExp _ (DerefIntegral i) = LitE $ IntegerL i
+derefToJSExp _ (DerefRational r) = LitE $ RationalL r
+derefToJSExp _ (DerefString s) = LitE $ StringL s
+derefToJSExp s (DerefList ds) = ListE $ map (derefToJSExp s) ds
+derefToJSExp s (DerefTuple ds) = TupE $ map (derefToJSExp s) ds
+
