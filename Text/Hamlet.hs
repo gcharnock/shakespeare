@@ -24,7 +24,7 @@ module Text.Hamlet
     , xhamlet
     , xhamletFile
       -- * jamlet
-    , jamlet
+    , jshamlet
       -- * I18N Hamlet
     , HtmlUrlI18n
     , ihamlet
@@ -61,7 +61,8 @@ import Language.Haskell.TH.Syntax
 import Language.Haskell.TH.Quote
 import Data.Char (isUpper, isDigit)
 import Data.Maybe (fromMaybe)
-import Data.Text (Text, pack)
+import Data.Text (Text, pack, cons)
+import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
 import Text.Blaze (Markup)
 import Text.Blaze.Renderer.Text (renderMarkup)
@@ -602,8 +603,8 @@ runtimeContentToHtml cd render i18nRender handleMsg = go
 
 ------------------------------------------------------------
 -- My Random-Walk Experiments
-jamlet :: QuasiQuoter
-jamlet = QuasiQuoter
+jshamlet :: QuasiQuoter
+jshamlet = QuasiQuoter
   { quoteExp = jhamletFromString jsRules defaultHamletSettings
   }
 
@@ -620,108 +621,54 @@ testString = foldl (++) "" [
 testQ :: String -> Q Exp
 testQ = jhamletFromString jsRules defaultHamletSettings
 
-escapeForJavascript :: TL.Text -> TL.Text
-escapeForJavascript s = TL.pack "\"" `TL.append` TL.foldr f (TL.pack "") s `TL.append` TL.pack "\""
-  where f '\n' acc = '\\' `TL.cons` 'n' `TL.cons` acc
-        f '\r' acc = '\\' `TL.cons` 'r' `TL.cons` acc
-        f '\'' acc = '\\' `TL.cons` '\'' `TL.cons` acc        
-        f '"'  acc = '\\' `TL.cons` '"' `TL.cons` acc        
-        f c    acc = c `TL.cons` acc
+escapeForJavascript :: Text -> Text
+escapeForJavascript s = pack "\"" `T.append` T.foldr f (T.pack "") s `T.append` T.pack "\""
+  where f '\n' acc = '\\' `cons` 'n' `cons` acc
+        f '\r' acc = '\\' `cons` 'r' `cons` acc
+        f '\'' acc = '\\' `cons` '\'' `cons` acc        
+        f '"'  acc = '\\' `cons` '"' `cons` acc        
+        f c    acc = c `cons` acc
   
 jhamletFromString :: Q HamletRules -> HamletSettings -> String -> Q Exp
 jhamletFromString qhr set s = do
     hr <- qhr
     let doc = docFromString set s
-    hrWithEnv hr $ \env -> docsToJSExpClosure env hr [] $ doc
+    hrWithEnv hr $ \env -> docsToJSExpClosure env hr $ doc
 
-jsEscape :: Markup -> Markup
-jsEscape s = preEscapedLazyText $ escapeForJavascript $ renderMarkup s
+--jsEscape :: Markup -> Markup
+--jsEscape s = preEscapedLazyText $ escapeForJavascript $ renderMarkup s
 
 jsRules :: Q HamletRules
 jsRules = do
-    i <- [|jsEscape|]
+    i <- [|id|]
     return $ HamletRules i ($ (Env Nothing Nothing)) (\_ b -> return b)
 
-docsToJSExpClosure :: Env -> HamletRules -> Scope -> [Doc] -> Q Exp
+docsToJSExpClosure :: Env -> HamletRules -> [Doc] -> Q Exp
 docsToJSExpClosure env hr = docsToJSExp
   where
-    docsToJSExp :: Scope -> [Doc] -> Q Exp
-    docsToJSExp scope docs = do
-        runIO $ print $ "[docsToJSExp] scope = " ++ show scope
-        exps <- mapM (docToJSExp scope) docs
+    docsToJSExp :: [Doc] -> Q Exp
+    docsToJSExp docs = do
+        runIO $ print $ "[docsToJSExp]"
+        exps <- mapM docToJSExp docs
         case exps of
             [] -> [|return ()|]
             [x] -> return x
             _ -> return $ DoE $ map NoBindS exps
 
-    docToJSExp :: Scope -> Doc -> Q Exp
-    docToJSExp scope doc = do
+    docToJSExp :: Doc -> Q Exp
+    docToJSExp doc = do
       runIO $ do print $ "[docToJSExp] doc = " ++ show doc
       case doc of 
-        DocForall list idents inside -> do
-          let list' = derefToJSExp scope list
-          (pat, extraScope) <- bindingPattern idents
-          let scope' = extraScope ++ scope
-          mh <- [|F.mapM_|]
-          inside' <- docsToJSExp scope' inside
-          let lam = LamE [pat] inside'
-          return $ mh `AppE` lam `AppE` list'
-        DocWith [] inside -> do
-          inside' <- docsToJSExp scope inside
-          return $ inside'
-        DocWith ((deref, idents):dis) inside -> do
-          let deref' = derefToJSExp scope deref
-          (pat, extraScope) <- bindingPattern idents
-          let scope' = extraScope ++ scope
-          inside' <- docToJSExp scope' (DocWith dis inside)
-          let lam = LamE [pat] inside'
-          return $ lam `AppE` deref'
-        DocMaybe val idents inside mno -> do
-          let val' = derefToJSExp scope val
-          (pat, extraScope) <- bindingPattern idents
-          let scope' = extraScope ++ scope
-          inside' <- docsToJSExp scope' inside
-          let inside'' = LamE [pat] inside'
-          ninside' <- case mno of
-                       Nothing -> [|Nothing|]
-                       Just no -> do
-                            no' <- docsToJSExp scope no
-                            j <- [|Just|]
-                            return $ j `AppE` no'
-          mh <- [|maybeH|]
-          return $ mh `AppE` val' `AppE` inside'' `AppE` ninside'
-        DocCond conds final -> do
-          conds' <- mapM go conds
-          final' <- case final of
-                    Nothing -> [|Nothing|]
-                    Just f -> do
-                        f' <- docsToJSExp scope f
-                        j <- [|Just|]
-                        return $ j `AppE` f'
-          ch <- [|condH|]
-          return $ ch `AppE` ListE conds' `AppE` final'
-          where
-            go :: (Deref, [Doc]) -> Q Exp
-            go (d, docs) = do
-              let d' = derefToJSExp ((specialOrIdent, VarE 'or):scope) d
-              docs' <- docsToJSExp scope docs
-              return $ TupE [d', docs']
-        DocCase deref cases -> do
-          let exp_ = derefToJSExp scope deref
-          matches <- mapM toMatch cases
-          return $ CaseE exp_ matches
-          where
-            toMatch :: (Binding, [Doc]) -> Q Match
-            toMatch (idents, inside) = do
-               (pat, extraScope) <- bindingPattern idents
-               let scope' = extraScope ++ scope
-               insideExp <- docsToJSExp scope' inside
-               return $ Match pat (NormalB insideExp) []
-        DocContent c -> contentToJSExp env hr scope c
+        DocForall _ _ _ -> error "$forall not supported"
+        DocWith _ _ -> error "$with not supported"
+        DocMaybe _ _ _ _ -> error "$maybe not supported"
+        DocCond _ _ -> error "$if not supported"
+        DocCase _ _ -> error "$case not supported"
+        DocContent c -> contentToJSExp env hr c
 
-contentToJSExp :: Env -> HamletRules -> Scope -> Content -> Q Exp
-contentToJSExp env hr scope c = do
-  runIO $ print $ "[contentToJSExp] scope = " ++ show scope
+contentToJSExp :: Env -> HamletRules -> Content -> Q Exp
+contentToJSExp env hr c = do
+  runIO $ print $ "[contentToJSExp]"
   case c of 
     ContentRaw s -> do
       runIO $ print "    [ConentRaw]"
@@ -730,8 +677,8 @@ contentToJSExp env hr scope c = do
       return $ hrFromHtml hr `AppE` (os `AppE` s')
     ContentVar d -> do
       runIO $ print "    [ConentVar]"      
-      str <- [|preEscapedText . pack|]
-      return $ hrFromHtml hr `AppE` (str `AppE` derefToJSExp scope d)
+      str <- [|preEscapedText . escapeForJavascript . pack|]
+      return $ hrFromHtml hr `AppE` (str `AppE` derefToJSExp d)
     ContentUrl hasParams d ->
       case urlRender env of
         Nothing -> error "URL interpolation used, but no URL renderer provided"
@@ -740,32 +687,32 @@ contentToJSExp env hr scope c = do
             ou <- if hasParams
                     then [|\(u, p) -> $(render') u p|]
                     else [|\u -> $(render') u []|]
-            let d' = derefToJSExp scope d
+            let d' = derefToJSExp d
             pet <- [|toHtml|]
             return $ hrFromHtml hr `AppE` (pet `AppE` (ou `AppE` d'))
-    ContentEmbed d -> hrEmbed hr env $ derefToJSExp scope d
+    ContentEmbed d -> hrEmbed hr env $ derefToJSExp d
     ContentMsg d ->
       case msgRender env of
         Nothing -> error "Message interpolation used, but no message renderer provided"
         Just wrender -> wrender $ \render ->
-            return $ hrFromHtml hr `AppE` (render `AppE` derefToJSExp scope d)
+            return $ hrFromHtml hr `AppE` (render `AppE` derefToJSExp d)
     ContentAttrs d -> do
       html <- [|attrsToHtml . toAttributes|]
-      return $ hrFromHtml hr `AppE` (html `AppE` derefToJSExp scope d)
+      return $ hrFromHtml hr `AppE` (html `AppE` derefToJSExp d)
 
 expType :: Ident -> Name -> Exp
 expType (Ident (c:_)) = if isUpper c || c == ':' then ConE else VarE
 expType (Ident "") = error "Bad Ident"
 
-derefToJSExp :: Scope -> Deref -> Exp
-derefToJSExp scope deref = ("\n[derefToJSExp] scope=" ++ show scope ++ " deref=" ++ show deref) `trace` case deref of
-  (DerefBranch x y) -> derefToJSExp scope x `AppE` derefToJSExp scope y
+derefToJSExp :: Deref -> Exp
+derefToJSExp deref = ("\n[derefToJSExp] deref=" ++ show deref) `trace` case deref of
+  (DerefBranch x y) -> derefToJSExp x `AppE` derefToJSExp y
   (DerefModulesIdent mods i@(Ident s)) ->
     expType i $ Name (mkOccName s) (NameQ $ mkModName $ intercalate "." mods)
-  (DerefIdent i@(Ident s)) -> LitE $ StringL ("+" ++ s ++ "+")
+  (DerefIdent (Ident s)) -> LitE $ StringL ("+" ++ s ++ "+")
   (DerefIntegral i) -> LitE $ IntegerL i
   (DerefRational r) -> LitE $ RationalL r
   (DerefString s) -> LitE $ StringL s
-  (DerefList ds) -> ListE $ map (derefToJSExp scope) ds
-  (DerefTuple ds) -> TupE $ map (derefToJSExp scope) ds
+  (DerefList ds) -> ListE $ map derefToJSExp ds
+  (DerefTuple ds) -> TupE $ map derefToJSExp ds
 
