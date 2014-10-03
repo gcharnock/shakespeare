@@ -1,5 +1,4 @@
 {-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeSynonymInstances #-}
@@ -8,8 +7,6 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE PatternGuards #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE OverloadedStrings #-}
 {-# OPTIONS_GHC -fno-warn-missing-fields #-}
 module Text.Hamlet
     ( -- * Plain HTML
@@ -26,8 +23,6 @@ module Text.Hamlet
     , ihamletFileReload
     , xhamlet
     , xhamletFile
-      -- * jamlet
-    , jshamlet
       -- * I18N Hamlet
     , HtmlUrlI18n
     , ihamlet
@@ -53,6 +48,7 @@ module Text.Hamlet
     , asHtmlUrl
     , attrsToHtml
     ) where
+
 import Text.Shakespeare.Base
 import Text.Hamlet.Parse
 #if MIN_VERSION_template_haskell(2,9,0)
@@ -63,17 +59,15 @@ import Language.Haskell.TH.Syntax
 import Language.Haskell.TH.Quote
 import Data.Char (isUpper, isDigit)
 import Data.Maybe (fromMaybe)
-import Data.Text (Text, pack, cons)
-import qualified Data.Text as T
+import Data.Text (Text, pack)
 import qualified Data.Text.Lazy as TL
 import Text.Blaze.Html (Html, toHtml)
 import Text.Blaze.Internal (preEscapedText)
 import qualified Data.Foldable as F
 import Control.Monad (mplus)
-import Data.Monoid (mempty, mappend, mconcat,(<>))
+import Data.Monoid (mempty, mappend, mconcat)
 import Control.Arrow ((***))
 import Data.List (intercalate)
-import Data.Ratio
 
 import Data.IORef
 import qualified Data.Map as M
@@ -100,7 +94,7 @@ attrsToHtml =
     foldr go mempty
   where
     go (k, v) rest =
-        toHtml (" " :: Text)
+        toHtml " "
         `mappend` preEscapedText k
         `mappend` preEscapedText (pack "=\"")
         `mappend` toHtml v
@@ -600,60 +594,3 @@ runtimeContentToHtml cd render i18nRender handleMsg = go
         Just (EMixin m) -> m render
         Just (EMixinI18n m) -> m i18nRender render
         _ -> error $ show d ++ ": expected EMixin"
-
-
-------------------------------------------------------------
--- My Random-Walk Experiments
-jshamlet :: QuasiQuoter
-jshamlet = QuasiQuoter
-  { quoteExp = jhamletFromString defaultHamletSettings
-  }
-
-escapeForJavascript :: Text -> Text
-escapeForJavascript s = "\"" <> T.foldr f "" s <> "\""
-  where f '\n' acc = '\\' `cons` 'n' `cons` acc
-        f '\r' acc = '\\' `cons` 'r' `cons` acc
-        f '\'' acc = '\\' `cons` '\'' `cons` acc        
-        f '"'  acc = '\\' `cons` '"' `cons` acc        
-        f c    acc = c `cons` acc
-  
-jhamletFromString :: HamletSettings -> String -> Q Exp
-jhamletFromString settings s = let docs = docFromString settings s in
-  return . LitE . StringL . T.unpack  =<< docsToJSFunction docs
-
-docsToJSFunction :: [Doc] -> Q Text
-docsToJSFunction docs = do jsBody <- docsToJSString docs
-                           return $ "function(){return " <> jsBody <> "}"
-
-docsToJSString :: [Doc] -> Q Text
-docsToJSString = fmap T.concat . mapM docToJSExp
-
-docToJSExp :: Doc -> Q Text
-docToJSExp = \case
-  DocForall _ _ _ -> error "$forall not supported"
-  DocWith _ _ -> error "$with not supported"
-  DocMaybe _ _ _ _ -> error "$maybe not supported"
-  DocCond _ _ -> error "$if not supported"
-  DocCase _ _ -> error "$case not supported"
-  DocContent c -> contentToJSExp c
-
-contentToJSExp :: Content -> Q Text
-contentToJSExp = \case
-  ContentRaw s -> return $ escapeForJavascript $ T.pack s
-  ContentVar d -> return $ "+" <> derefToJSExp d <> "+"
-  ContentUrl _ _ -> error "URL Rendering not yet supported"
-  ContentEmbed d -> return $ derefToJSExp d
-  ContentMsg _ -> error "Messages not supported in javascript yet"
-  ContentAttrs _ -> error "ContentAttrs not supported in javascript yet"
-
-derefToJSExp :: Deref -> Text
-derefToJSExp = \case
-  DerefBranch _ _ -> error "DerefBranch not suppored in javascript"
-  DerefModulesIdent _ _ -> error "DerefModulesIdent not supported in javascript"
-  DerefIdent (Ident s) -> T.pack s
-  DerefIntegral i -> T.pack.show $ i
-  DerefRational r -> T.pack.show $ (fromIntegral (numerator r) / fromIntegral (denominator r) :: Double)
-  DerefString s -> "\"" <> T.pack s <> "\""
-  DerefList ds -> "[" <> (T.intercalate "," $ map derefToJSExp ds) <> "]"
-  DerefTuple _ -> error "DerefTuple  not suppored in javascript"
-

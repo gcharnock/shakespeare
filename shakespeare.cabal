@@ -63,6 +63,7 @@ library
                      Text.Shakespeare.Base
                      Text.Shakespeare
                      Text.TypeScript
+                     Text.JHamlet
     other-modules:   Text.Hamlet.Parse
                      Text.Css
                      Text.MkSizeType
