@@ -1,4 +1,5 @@
 {-# LANGUAGE TemplateHaskell #-}
+{-# LANGUAGE QuasiQuotes #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeSynonymInstances #-}
@@ -7,6 +8,8 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE EmptyDataDecls #-}
 {-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# OPTIONS_GHC -fno-warn-missing-fields #-}
 module Text.Hamlet
     ( -- * Plain HTML
@@ -50,7 +53,6 @@ module Text.Hamlet
     , asHtmlUrl
     , attrsToHtml
     ) where
-import Debug.Trace
 import Text.Shakespeare.Base
 import Text.Hamlet.Parse
 #if MIN_VERSION_template_haskell(2,9,0)
@@ -64,15 +66,14 @@ import Data.Maybe (fromMaybe)
 import Data.Text (Text, pack, cons)
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
-import Text.Blaze (Markup)
-import Text.Blaze.Renderer.Text (renderMarkup)
 import Text.Blaze.Html (Html, toHtml)
-import Text.Blaze.Internal (preEscapedText,preEscapedLazyText)
+import Text.Blaze.Internal (preEscapedText)
 import qualified Data.Foldable as F
 import Control.Monad (mplus)
-import Data.Monoid (mempty, mappend, mconcat)
+import Data.Monoid (mempty, mappend, mconcat,(<>))
 import Control.Arrow ((***))
 import Data.List (intercalate)
+import Data.Ratio
 
 import Data.IORef
 import qualified Data.Map as M
@@ -99,7 +100,7 @@ attrsToHtml =
     foldr go mempty
   where
     go (k, v) rest =
-        toHtml " "
+        toHtml (" " :: Text)
         `mappend` preEscapedText k
         `mappend` preEscapedText (pack "=\"")
         `mappend` toHtml v
@@ -605,114 +606,54 @@ runtimeContentToHtml cd render i18nRender handleMsg = go
 -- My Random-Walk Experiments
 jshamlet :: QuasiQuoter
 jshamlet = QuasiQuoter
-  { quoteExp = jhamletFromString jsRules defaultHamletSettings
+  { quoteExp = jhamletFromString defaultHamletSettings
   }
 
-testString :: String
-testString = foldl (++) "" [
-  "<html>",
-  "    <head>",
-  "        <script>",
-  "            alert(\"hello world\")",
-  "        <title>#{title}</title>",
-  "    <body>"
-  ]
-
-testQ :: String -> Q Exp
-testQ = jhamletFromString jsRules defaultHamletSettings
-
 escapeForJavascript :: Text -> Text
-escapeForJavascript s = pack "\"" `T.append` T.foldr f (T.pack "") s `T.append` T.pack "\""
+escapeForJavascript s = "\"" <> T.foldr f "" s <> "\""
   where f '\n' acc = '\\' `cons` 'n' `cons` acc
         f '\r' acc = '\\' `cons` 'r' `cons` acc
         f '\'' acc = '\\' `cons` '\'' `cons` acc        
         f '"'  acc = '\\' `cons` '"' `cons` acc        
         f c    acc = c `cons` acc
   
-jhamletFromString :: Q HamletRules -> HamletSettings -> String -> Q Exp
-jhamletFromString qhr set s = do
-    hr <- qhr
-    let doc = docFromString set s
-    hrWithEnv hr $ \env -> docsToJSExpClosure env hr $ doc
+jhamletFromString :: HamletSettings -> String -> Q Exp
+jhamletFromString settings s = let docs = docFromString settings s in
+  return . LitE . StringL . T.unpack  =<< docsToJSFunction docs
 
---jsEscape :: Markup -> Markup
---jsEscape s = preEscapedLazyText $ escapeForJavascript $ renderMarkup s
+docsToJSFunction :: [Doc] -> Q Text
+docsToJSFunction docs = do jsBody <- docsToJSString docs
+                           return $ "function(){return " <> jsBody <> "}"
 
-jsRules :: Q HamletRules
-jsRules = do
-    i <- [|id|]
-    return $ HamletRules i ($ (Env Nothing Nothing)) (\_ b -> return b)
+docsToJSString :: [Doc] -> Q Text
+docsToJSString = fmap T.concat . mapM docToJSExp
 
-docsToJSExpClosure :: Env -> HamletRules -> [Doc] -> Q Exp
-docsToJSExpClosure env hr = docsToJSExp
-  where
-    docsToJSExp :: [Doc] -> Q Exp
-    docsToJSExp docs = do
-        runIO $ print $ "[docsToJSExp]"
-        exps <- mapM docToJSExp docs
-        case exps of
-            [] -> [|return ()|]
-            [x] -> return x
-            _ -> return $ DoE $ map NoBindS exps
+docToJSExp :: Doc -> Q Text
+docToJSExp = \case
+  DocForall _ _ _ -> error "$forall not supported"
+  DocWith _ _ -> error "$with not supported"
+  DocMaybe _ _ _ _ -> error "$maybe not supported"
+  DocCond _ _ -> error "$if not supported"
+  DocCase _ _ -> error "$case not supported"
+  DocContent c -> contentToJSExp c
 
-    docToJSExp :: Doc -> Q Exp
-    docToJSExp doc = do
-      runIO $ do print $ "[docToJSExp] doc = " ++ show doc
-      case doc of 
-        DocForall _ _ _ -> error "$forall not supported"
-        DocWith _ _ -> error "$with not supported"
-        DocMaybe _ _ _ _ -> error "$maybe not supported"
-        DocCond _ _ -> error "$if not supported"
-        DocCase _ _ -> error "$case not supported"
-        DocContent c -> contentToJSExp env hr c
+contentToJSExp :: Content -> Q Text
+contentToJSExp = \case
+  ContentRaw s -> return $ escapeForJavascript $ T.pack s
+  ContentVar d -> return $ "+" <> derefToJSExp d <> "+"
+  ContentUrl _ _ -> error "URL Rendering not yet supported"
+  ContentEmbed d -> return $ derefToJSExp d
+  ContentMsg _ -> error "Messages not supported in javascript yet"
+  ContentAttrs _ -> error "ContentAttrs not supported in javascript yet"
 
-contentToJSExp :: Env -> HamletRules -> Content -> Q Exp
-contentToJSExp env hr c = do
-  runIO $ print $ "[contentToJSExp]"
-  case c of 
-    ContentRaw s -> do
-      runIO $ print "    [ConentRaw]"
-      os <- [|preEscapedText . pack|]
-      let s' = LitE $ StringL s
-      return $ hrFromHtml hr `AppE` (os `AppE` s')
-    ContentVar d -> do
-      runIO $ print "    [ConentVar]"      
-      str <- [|preEscapedText . escapeForJavascript . pack|]
-      return $ hrFromHtml hr `AppE` (str `AppE` derefToJSExp d)
-    ContentUrl hasParams d ->
-      case urlRender env of
-        Nothing -> error "URL interpolation used, but no URL renderer provided"
-        Just wrender -> wrender $ \render -> do
-            let render' = return render
-            ou <- if hasParams
-                    then [|\(u, p) -> $(render') u p|]
-                    else [|\u -> $(render') u []|]
-            let d' = derefToJSExp d
-            pet <- [|toHtml|]
-            return $ hrFromHtml hr `AppE` (pet `AppE` (ou `AppE` d'))
-    ContentEmbed d -> hrEmbed hr env $ derefToJSExp d
-    ContentMsg d ->
-      case msgRender env of
-        Nothing -> error "Message interpolation used, but no message renderer provided"
-        Just wrender -> wrender $ \render ->
-            return $ hrFromHtml hr `AppE` (render `AppE` derefToJSExp d)
-    ContentAttrs d -> do
-      html <- [|attrsToHtml . toAttributes|]
-      return $ hrFromHtml hr `AppE` (html `AppE` derefToJSExp d)
-
-expType :: Ident -> Name -> Exp
-expType (Ident (c:_)) = if isUpper c || c == ':' then ConE else VarE
-expType (Ident "") = error "Bad Ident"
-
-derefToJSExp :: Deref -> Exp
-derefToJSExp deref = ("\n[derefToJSExp] deref=" ++ show deref) `trace` case deref of
-  (DerefBranch x y) -> derefToJSExp x `AppE` derefToJSExp y
-  (DerefModulesIdent mods i@(Ident s)) ->
-    expType i $ Name (mkOccName s) (NameQ $ mkModName $ intercalate "." mods)
-  (DerefIdent (Ident s)) -> LitE $ StringL ("+" ++ s ++ "+")
-  (DerefIntegral i) -> LitE $ IntegerL i
-  (DerefRational r) -> LitE $ RationalL r
-  (DerefString s) -> LitE $ StringL s
-  (DerefList ds) -> ListE $ map derefToJSExp ds
-  (DerefTuple ds) -> TupE $ map derefToJSExp ds
+derefToJSExp :: Deref -> Text
+derefToJSExp = \case
+  DerefBranch _ _ -> error "DerefBranch not suppored in javascript"
+  DerefModulesIdent _ _ -> error "DerefModulesIdent not supported in javascript"
+  DerefIdent (Ident s) -> T.pack s
+  DerefIntegral i -> T.pack.show $ i
+  DerefRational r -> T.pack.show $ (fromIntegral (numerator r) / fromIntegral (denominator r) :: Double)
+  DerefString s -> "\"" <> T.pack s <> "\""
+  DerefList ds -> "[" <> (T.intercalate "," $ map derefToJSExp ds) <> "]"
+  DerefTuple _ -> error "DerefTuple  not suppored in javascript"
 
